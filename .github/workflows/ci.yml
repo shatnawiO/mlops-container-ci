@@ -1,0 +1,112 @@
+name: CI / CD Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  lint-and-test:
+    name: Lint & Pytest Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        # Pinned to actions/checkout v4.2.2 full commit SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set up Python 3.11
+        # Pinned to actions/setup-python v5.3.0 full commit SHA
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run Ruff Linting
+        run: |
+          ruff check .
+
+      - name: Train and Validate Model Artifact
+        run: |
+          python -m src.train.train
+
+      - name: Run Pytest Test Suite
+        run: |
+          pytest -v --tb=short
+
+  build-scan-and-push:
+    name: Build, Scan & Push to GHCR
+    needs: lint-and-test
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        # Pinned to actions/checkout v4.2.2 full commit SHA
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Set Lowercase Image Repository Name
+        # Docker requires all image names and registries to be strictly lowercase
+        run: |
+          echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        # Pinned to docker/setup-buildx-action v3.7.1 full commit SHA
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        # Pinned to docker/login-action v3.3.0 full commit SHA
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Local Image for Trivy Vulnerability Scan
+        # Pinned to docker/build-push-action v6.18.0 full commit SHA
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Run Trivy Security Vulnerability Scan
+        # Pinned to aquasecurity/trivy-action v0.35.0 full commit SHA
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+
+      - name: Build and Push Docker Image to GHCR
+        id: docker_build
+        # Pinned to docker/build-push-action v6.18.0 full commit SHA
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+      - name: Print Image Digest & Summary
+        run: |
+          echo "### Image Successfully Pushed to GHCR :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Name:** \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA Tag:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest:** \`${{ steps.docker_build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "Digest: ${{ steps.docker_build.outputs.digest }}"
